@@ -1,6 +1,6 @@
 ![:name](https://count.getloli.com/@astrbot_plugin_xbox?name=astrbot_plugin_xbox&theme=booru-r6gdrawfriends&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
-# AstrBot Xbox Game Pass 入库提醒插件 🎮
+# Xbox Game Pass 入库提醒插件 🎮
 
 获取微软 Xbox Game Pass 最新入库游戏列表，支持后台定时推送新游提醒和手动查询。
 
