@@ -1,0 +1,20 @@
+name: astrbot_plugin_xbox
+display_name: Xbox Game Pass 入库提醒
+desc: 获取微软 Xbox Game Pass 最新入库游戏列表，支持后台定时推送新游提醒和手动查询。
+help: |
+  使用方法：
+  /xgp - 查看最近入库的游戏
+  
+  配置说明：
+  请在管理面板设置推送目标 (push_targets) 和推送时间 (cron_time)。
+version: 1.0.0
+author: xiaoruange39
+repo: "https://github.com/xiaoruange39/astrbot_plugin_xbox"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - satori
+  - kook
+  - discord
+astrbot_version: ">=4.16"
