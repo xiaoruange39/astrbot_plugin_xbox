@@ -5,8 +5,21 @@ import asyncio
 import os
 import subprocess
 import platform
+from urllib.parse import urlparse
 from PIL import Image, ImageDraw, ImageFont
 from astrbot.api import logger
+
+# Pillow global pixel limit to prevent decompression bombs
+Image.MAX_IMAGE_PIXELS = 25_000_000
+
+# Allowed image host domains (Microsoft CDN)
+_ALLOWED_IMAGE_HOSTS = {
+    "store-images.s-microsoft.com",
+    "store-images.microsoft.com",
+    "images-eds-ssl.xboxlive.com",
+    "musicimage.xboxlive.com",
+    "images-eds.xboxlive.com",
+}
 
 # Define green color for XGP
 XGP_GREEN = "#0f7e17" # Deeper official green background
@@ -143,10 +156,13 @@ class XGPImageGenerator:
         return ImageFont.load_default()
 
     async def _download_image(self, url: str) -> "Image.Image | None":
-        """Download and open an image with size and pixel safeguards."""
+        """Download and open an image with size, pixel, and domain safeguards."""
         max_content_bytes = 10 * 1024 * 1024  # 10 MB
-        max_pixels = 25_000_000  # 25 MP
         try:
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_IMAGE_HOSTS:
+                logger.debug(f"Blocked image download from untrusted host: {url}")
+                return None
             async with self._download_semaphore:
                 resp = await self.client.get(url)
                 resp.raise_for_status()
@@ -158,11 +174,10 @@ class XGPImageGenerator:
                     logger.debug(f"Image body too large ({len(resp.content)} bytes), skipping: {url}")
                     return None
                 img = Image.open(io.BytesIO(resp.content))
-                w, h = img.size
-                if w * h > max_pixels:
-                    logger.debug(f"Image pixel count too high ({w}x{h}), skipping: {url}")
-                    return None
                 return img.convert("RGBA")
+        except Image.DecompressionBombError:
+            logger.warning(f"Decompression bomb detected, skipping: {url}")
+            return None
         except httpx.HTTPError as e:
             logger.debug(f"Failed to download image {url}: {e}")
             return None

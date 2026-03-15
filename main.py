@@ -235,23 +235,19 @@ class XGPNotifyPlugin(Star):
                 markets = ["US", "HK", "CN"]
                 official_new_lists = [
                     XGP_RECENTLY_ADDED,
-                    "ced24fc9-d18e-4c6b-8af8-3600ca459424", # New on PC
-                    "4942cf41-9492-4113-ac0c-25089304323c"  # New on Console
+                    "ced24fc9-d18e-4c6b-8af8-3600ca459424",  # New on PC
+                    "4942cf41-9492-4113-ac0c-25089304323c"   # New on Console
                 ]
-                
+
                 all_current_ids_ordered = []
                 all_current_ids_seen = set()
                 official_recent_ordered = []
-                
-                # Fetch baseline libraries
-                pc_ids = set(await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US"))
-                console_ids = set(await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US"))
-                
+
                 for mkt in markets:
                     m_pc = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], mkt)
                     m_console = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], mkt)
                     m_new = await self._fetch_gamepass_lists(official_new_lists, mkt)
-                    
+
                     for gid in m_pc:
                         if gid not in all_current_ids_seen:
                             all_current_ids_ordered.append(gid)
@@ -260,16 +256,22 @@ class XGPNotifyPlugin(Star):
                         if gid not in all_current_ids_seen:
                             all_current_ids_ordered.append(gid)
                             all_current_ids_seen.add(gid)
-                    
+
                     for nid in m_new:
                         if nid not in official_recent_ordered:
                             official_recent_ordered.append(nid)
 
+                # Guard: only update state if we actually got data from APIs
+                if not all_current_ids_seen:
+                    logger.warning("Background check got empty results from all markets, skipping state update.")
+                    await asyncio.sleep(self.check_interval_seconds)
+                    continue
+
                 new_ids = [gid for gid in all_current_ids_ordered if gid not in self.known_games_set]
-                
-                # Update discovery storage (remove games that left)
+
+                # Remove games that left the library (safe: all_current_ids_seen is non-empty)
                 self.new_discovery = [gid for gid in self.new_discovery if gid in all_current_ids_seen]
-                
+
                 if not self.known_games_list:
                     # Initial baseline
                     self.known_games_list = list(all_current_ids_ordered)
@@ -278,21 +280,18 @@ class XGPNotifyPlugin(Star):
                     self.new_discovery = official_recent_ordered[:50]
                 elif new_ids:
                     logger.info(f"Background check found {len(new_ids)} new shadow-drops.")
-                    # Baseline set keeps all ever-seen IDs (never truncated)
                     self.known_games_set.update(new_ids)
-                    # Display list is truncated for persistence size only
                     self.known_games_list = list(new_ids) + self.known_games_list
                     if len(self.known_games_list) > 5000:
                         self.known_games_list = self.known_games_list[:5000]
                     self._save_json_list(self.known_games_path, self.known_games_list)
-                    
-                    # Prepend discovered IDs to discovery list
+
                     for gid in reversed(new_ids):
                         if gid not in self.new_discovery:
                             self.new_discovery.insert(0, gid)
                     self.new_discovery = self.new_discovery[:200]
-                
-                # Merge official new ranking into discovery list for comprehensive tracking
+
+                # Merge official new ranking
                 discovery_set = set(self.new_discovery)
                 for gid in official_recent_ordered:
                     if gid not in discovery_set:
@@ -300,7 +299,7 @@ class XGPNotifyPlugin(Star):
                         discovery_set.add(gid)
                 self.new_discovery = self.new_discovery[:200]
                 self._save_json_list(self.discovery_path, self.new_discovery)
-                
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -332,6 +331,16 @@ class XGPNotifyPlugin(Star):
                 logger.error(f"Cron loop error: {e}")
                 await asyncio.sleep(60)
 
+    async def _fetch_all_library_ids(self) -> set[str]:
+        """Fetch PC + Console IDs across all tracked markets for accurate filtering."""
+        all_ids: set[str] = set()
+        for mkt in ["US", "HK", "CN"]:
+            pc = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], mkt)
+            console = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], mkt)
+            all_ids.update(pc)
+            all_ids.update(console)
+        return all_ids
+
     async def _perform_scheduled_push(self):
         """执行定时推送逻辑"""
         targets = self.config.get("push_targets", [])
@@ -339,10 +348,8 @@ class XGPNotifyPlugin(Star):
             logger.info("未配置推送目标，跳过定时推送。")
             return
 
-        # Check for updates if configured
         push_on_update_only = self.config.get("push_on_update_only", True)
         if push_on_update_only:
-            # Compare current discovery with last pushed
             if set(self.new_discovery) == set(self.last_pushed_games):
                 logger.info("Game Pass 数据未更新，跳过定时推送。")
                 return
@@ -351,19 +358,18 @@ class XGPNotifyPlugin(Star):
 
         temp_path = None
         try:
-            pc_ids = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US")
-            console_ids = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US")
-            all_lib = set(pc_ids) | set(console_ids)
+            all_lib = await self._fetch_all_library_ids()
+            pc_ids = set(await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US"))
+            console_ids = set(await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US"))
 
-            # Snapshot shared state for consistency
             discovery_snapshot = list(self.new_discovery)
             target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
 
             if not target_ids:
                 return
 
-            limit = self.config.get("display_limit", 10)
-            details = await self._fetch_game_details(target_ids[:limit], set(pc_ids), set(console_ids))
+            limit = min(self.config.get("display_limit", 10), 36)
+            details = await self._fetch_game_details(target_ids[:limit], pc_ids, console_ids)
             if not details:
                 return
 
@@ -405,19 +411,18 @@ class XGPNotifyPlugin(Star):
 
         temp_path = None
         try:
-            pc_ids = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US")
-            console_ids = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US")
-            all_lib = set(pc_ids) | set(console_ids)
+            all_lib = await self._fetch_all_library_ids()
+            pc_ids = set(await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US"))
+            console_ids = set(await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US"))
 
-            # Snapshot shared state
             discovery_snapshot = list(self.new_discovery)
             target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
             if not target_ids:
                 yield event.plain_result("😅 暂未发现新入库的游戏。")
                 return
 
-            limit = self.config.get("display_limit", 10)
-            details = await self._fetch_game_details(target_ids[:limit], set(pc_ids), set(console_ids))
+            limit = min(self.config.get("display_limit", 10), 36)
+            details = await self._fetch_game_details(target_ids[:limit], pc_ids, console_ids)
 
             if not details:
                 yield event.plain_result("😅 无法获取游戏详情，请稍后再试。")
