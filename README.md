@@ -4,7 +4,7 @@
 
 获取微软 Xbox Game Pass 最新入库游戏列表，支持后台定时推送新游提醒和手动查询。
 
-![XGP Preview](https://img.cdn1.vip/i/69b599b4025f0_1773509044.webp) 
+![XGP Preview](https://picui.ogmua.cn/s1/2026/03/15/69b6c6c6a6635.webp) 
 
 ## ✨ 特性
 
