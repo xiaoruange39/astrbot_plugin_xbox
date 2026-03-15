@@ -56,11 +56,17 @@ class XGPNotifyPlugin(Star):
         return []
 
     def _save_json_list(self, path: str, data: list[str]):
+        tmp_path = path + ".tmp"
         try:
-            with open(path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, path)
         except Exception as e:
             logger.error(f"Failed to save {path}: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     async def _fetch_gamepass_lists(self, list_ids: list[str], market: str = "US") -> list[str]:
         """批量获取多个 Game Pass 列表中的去重游戏 ID"""
@@ -72,7 +78,7 @@ class XGPNotifyPlugin(Star):
                 if resp.status_code == 200:
                     data = resp.json()
                     if isinstance(data, list):
-                        ids = [item["id"] for item in data if isinstance(item, dict) and "id" in item]
+                        ids = [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
                         all_ids.extend(ids)
             except Exception as e:
                 logger.error(f"Failed to fetch list {lid} (mkt={market}): {e}")
@@ -85,7 +91,7 @@ class XGPNotifyPlugin(Star):
                 seen.add(gid)
         return unique_ids
 
-    def _parse_product(self, product: dict, pc_ids: set = None, console_ids: set = None) -> dict | None:
+    def _parse_product(self, product: dict, pc_ids: set | None = None, console_ids: set | None = None) -> dict | None:
         """Parse a single product from the catalog API response."""
         pid = product.get("ProductId", "unknown")
         try:
@@ -173,7 +179,7 @@ class XGPNotifyPlugin(Star):
                         tiers.append("PREMIUM")
         return tiers
 
-    def _determine_platforms(self, product: dict, pid: str, pc_ids: set = None, console_ids: set = None) -> str:
+    def _determine_platforms(self, product: dict, pid: str, pc_ids: set | None = None, console_ids: set | None = None) -> str:
         """Determine platform tags for a product."""
         p_tags = []
         is_pc = (pc_ids is not None and pid in pc_ids)
@@ -194,7 +200,7 @@ class XGPNotifyPlugin(Star):
             
         return " · ".join(p_tags) if p_tags else "主机 · PC"
 
-    async def _fetch_game_details(self, game_ids: list[str], pc_ids: set = None, console_ids: set = None) -> list[dict]:
+    async def _fetch_game_details(self, game_ids: list[str], pc_ids: set | None = None, console_ids: set | None = None) -> list[dict]:
         """Fetch detailed information for a list of game IDs (concurrent batches)."""
         if not game_ids:
             return []
@@ -280,10 +286,10 @@ class XGPNotifyPlugin(Star):
                     self.new_discovery = official_recent_ordered[:50]
                 elif new_ids:
                     logger.info(f"Background check found {len(new_ids)} new shadow-drops.")
-                    self.known_games_set.update(new_ids)
                     self.known_games_list = list(new_ids) + self.known_games_list
                     if len(self.known_games_list) > 5000:
                         self.known_games_list = self.known_games_list[:5000]
+                    self.known_games_set = set(self.known_games_list)
                     self._save_json_list(self.known_games_path, self.known_games_list)
 
                     for gid in reversed(new_ids):
@@ -373,11 +379,15 @@ class XGPNotifyPlugin(Star):
             target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
 
             if not target_ids:
+                self.last_pushed_games = discovery_snapshot
+                self._save_json_list(self.last_pushed_path, self.last_pushed_games)
                 return
 
             limit = min(self.config.get("display_limit", 10), 36)
             details = await self._fetch_game_details(target_ids[:limit], pc_ids, console_ids)
             if not details:
+                self.last_pushed_games = discovery_snapshot
+                self._save_json_list(self.last_pushed_path, self.last_pushed_games)
                 return
 
             img_bytes = await self.image_gen.generate_announcement_image("现已加入 Xbox Game Pass", details)
