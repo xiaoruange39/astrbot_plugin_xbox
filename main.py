@@ -35,6 +35,7 @@ class XGPNotifyPlugin(Star):
         self.client = httpx.AsyncClient(timeout=15.0)
         self.check_interval_seconds = 1800  # 30 minutes for background discovery
         self.image_gen = XGPImageGenerator()
+        self._state_lock = asyncio.Lock()
         
         # Start background polling task (for discovery and update tracking)
         self.poll_task = asyncio.create_task(self._background_check())
@@ -69,20 +70,40 @@ class XGPNotifyPlugin(Star):
                 pass
 
     async def _fetch_gamepass_lists(self, list_ids: list[str], market: str = "US") -> list[str]:
-        """批量获取多个 Game Pass 列表中的去重游戏 ID"""
+        """批量获取多个 Game Pass 列表中的去重游戏 ID（含基本重试）"""
         all_ids = []
         for lid in list_ids:
             url = f"https://catalog.gamepass.com/sigls/v2?id={lid}&market={market}&language=en-US"
-            try:
-                resp = await self.client.get(url)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    if isinstance(data, list):
-                        ids = [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
-                        all_ids.extend(ids)
-            except Exception as e:
-                logger.error(f"Failed to fetch list {lid} (mkt={market}): {e}")
-        
+            last_err = None
+            for attempt in range(3):
+                try:
+                    resp = await self.client.get(url)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        if isinstance(data, list):
+                            ids = [item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+                            all_ids.extend(ids)
+                        last_err = None
+                        break
+                    elif resp.status_code >= 500:
+                        last_err = f"HTTP {resp.status_code}"
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    else:
+                        last_err = f"HTTP {resp.status_code}"
+                        break  # Client errors are not retryable
+                except httpx.TimeoutException as e:
+                    last_err = e
+                    await asyncio.sleep(2 ** attempt)
+                except httpx.HTTPError as e:
+                    last_err = e
+                    break
+                except Exception as e:
+                    last_err = e
+                    break
+            if last_err:
+                logger.error(f"Failed to fetch list {lid} (mkt={market}) after retries: {last_err}")
+
         seen = set()
         unique_ids = []
         for gid in all_ids:
@@ -275,36 +296,37 @@ class XGPNotifyPlugin(Star):
 
                 new_ids = [gid for gid in all_current_ids_ordered if gid not in self.known_games_set]
 
-                # Remove games that left the library (safe: all_current_ids_seen is non-empty)
-                self.new_discovery = [gid for gid in self.new_discovery if gid in all_current_ids_seen]
+                async with self._state_lock:
+                    # Remove games that left the library (safe: all_current_ids_seen is non-empty)
+                    self.new_discovery = [gid for gid in self.new_discovery if gid in all_current_ids_seen]
 
-                if not self.known_games_list:
-                    # Initial baseline
-                    self.known_games_list = list(all_current_ids_ordered)
-                    self.known_games_set = set(all_current_ids_ordered)
-                    self._save_json_list(self.known_games_path, self.known_games_list)
-                    self.new_discovery = official_recent_ordered[:50]
-                elif new_ids:
-                    logger.info(f"Background check found {len(new_ids)} new shadow-drops.")
-                    self.known_games_list = list(new_ids) + self.known_games_list
-                    if len(self.known_games_list) > 5000:
-                        self.known_games_list = self.known_games_list[:5000]
-                    self.known_games_set = set(self.known_games_list)
-                    self._save_json_list(self.known_games_path, self.known_games_list)
+                    if not self.known_games_list:
+                        # Initial baseline
+                        self.known_games_list = list(all_current_ids_ordered)
+                        self.known_games_set = set(all_current_ids_ordered)
+                        self._save_json_list(self.known_games_path, self.known_games_list)
+                        self.new_discovery = official_recent_ordered[:50]
+                    elif new_ids:
+                        logger.info(f"Background check found {len(new_ids)} new shadow-drops.")
+                        self.known_games_list = list(new_ids) + self.known_games_list
+                        if len(self.known_games_list) > 5000:
+                            self.known_games_list = self.known_games_list[:5000]
+                        self.known_games_set = set(self.known_games_list)
+                        self._save_json_list(self.known_games_path, self.known_games_list)
 
-                    for gid in reversed(new_ids):
-                        if gid not in self.new_discovery:
-                            self.new_discovery.insert(0, gid)
+                        for gid in reversed(new_ids):
+                            if gid not in self.new_discovery:
+                                self.new_discovery.insert(0, gid)
+                        self.new_discovery = self.new_discovery[:200]
+
+                    # Merge official new ranking
+                    discovery_set = set(self.new_discovery)
+                    for gid in official_recent_ordered:
+                        if gid not in discovery_set:
+                            self.new_discovery.append(gid)
+                            discovery_set.add(gid)
                     self.new_discovery = self.new_discovery[:200]
-
-                # Merge official new ranking
-                discovery_set = set(self.new_discovery)
-                for gid in official_recent_ordered:
-                    if gid not in discovery_set:
-                        self.new_discovery.append(gid)
-                        discovery_set.add(gid)
-                self.new_discovery = self.new_discovery[:200]
-                self._save_json_list(self.discovery_path, self.new_discovery)
+                    self._save_json_list(self.discovery_path, self.new_discovery)
 
             except asyncio.CancelledError:
                 raise
@@ -319,18 +341,33 @@ class XGPNotifyPlugin(Star):
             if not cron_expr:
                 await asyncio.sleep(60)
                 continue
-            
+
             try:
                 cron_iter = croniter(cron_expr, datetime.now())
                 next_time = cron_iter.get_next(datetime)
                 wait_seconds = (next_time - datetime.now()).total_seconds()
-                
+
                 if wait_seconds > 0:
                     logger.info(f"XGP 定时任务下次执行时间: {next_time}")
-                    await asyncio.sleep(wait_seconds)
-                
+                    # Sleep in short intervals to detect config changes
+                    while wait_seconds > 0:
+                        sleep_chunk = min(wait_seconds, 30)
+                        await asyncio.sleep(sleep_chunk)
+                        wait_seconds -= sleep_chunk
+                        # Re-check config: if cron_time changed or cleared, break
+                        new_cron = self.config.get("cron_time", "").strip()
+                        if new_cron != cron_expr:
+                            logger.info("Cron 配置已变更，重新计算下次执行时间。")
+                            break
+                    else:
+                        # Loop completed without break -> execute push
+                        await self._perform_scheduled_push()
+                        continue
+                    # Broke out of while -> config changed, restart outer loop
+                    continue
+
                 await self._perform_scheduled_push()
-                
+
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -375,7 +412,8 @@ class XGPNotifyPlugin(Star):
         try:
             all_lib, pc_ids, console_ids = await self._fetch_all_library_ids()
 
-            discovery_snapshot = list(self.new_discovery)
+            async with self._state_lock:
+                discovery_snapshot = list(self.new_discovery)
             target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
 
             if not target_ids:
@@ -430,7 +468,8 @@ class XGPNotifyPlugin(Star):
         try:
             all_lib, pc_ids, console_ids = await self._fetch_all_library_ids()
 
-            discovery_snapshot = list(self.new_discovery)
+            async with self._state_lock:
+                discovery_snapshot = list(self.new_discovery)
             target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
             if not target_ids:
                 yield event.plain_result("😅 暂未发现新入库的游戏。")

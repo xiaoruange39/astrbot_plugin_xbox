@@ -47,8 +47,8 @@ class XGPImageGenerator:
         self.xbox_icon = None
         if os.path.exists(self.xbox_logo_path):
             try:
-                # Load and prepare image (handling transparency if generated with white bg)
-                img_logo = Image.open(self.xbox_logo_path).convert("RGBA")
+                with Image.open(self.xbox_logo_path) as img_logo_raw:
+                    img_logo = img_logo_raw.convert("RGBA")
                 # Make white background transparent if reportlab didn't set alpha
                 data = img_logo.getdata()
                 new_data = []
@@ -233,13 +233,18 @@ class XGPImageGenerator:
                         return img
             return None
             
-        posters_raw = await asyncio.gather(
+        # Log and replace exceptions with None so rendering can continue
+        posters_raw = []
+        for i, p in enumerate(await asyncio.gather(
             *(fetch_poster(g) for g in games), return_exceptions=True
-        )
-        # Replace exceptions with None so rendering can continue
-        posters_raw = [
-            p if isinstance(p, Image.Image) else None for p in posters_raw
-        ]
+        )):
+            if isinstance(p, Exception):
+                logger.debug(f"Poster download failed for '{games[i].get('title', '?')}': {p}")
+                posters_raw.append(None)
+            elif isinstance(p, Image.Image):
+                posters_raw.append(p)
+            else:
+                posters_raw.append(None)
         
         # Offload CPU-intensive Pillow rendering to a thread
         return await asyncio.to_thread(self._render_image, title, games, posters_raw)
