@@ -10,11 +10,4 @@ help: |
 version: 1.0.0
 author: xiaoruange39
 repo: "https://github.com/xiaoruange39/astrbot_plugin_xbox"
-support_platforms:
-  - aiocqhttp
-  - qq_official
-  - telegram
-  - satori
-  - kook
-  - discord
 astrbot_version: ">=4.16"

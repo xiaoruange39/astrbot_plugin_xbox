@@ -5,10 +5,9 @@ import httpx
 import tempfile
 from datetime import datetime
 from croniter import croniter
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult, MessageChain
-from astrbot.api.star import Context, Star, register
+from astrbot.api.event import filter, AstrMessageEvent, MessageChain
+from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger, AstrBotConfig
-from astrbot.api.message_components import Image
 from .image_utils import XGPImageGenerator
 
 # Game Pass Catalog API List IDs
@@ -22,7 +21,7 @@ class XGPNotifyPlugin(Star):
         super().__init__(context)
         self.config = config
         logger.info(f"XGP 插件已加载，配置项数量: {len(self.config)}")
-        self.data_dir = os.path.dirname(__file__)
+        self.data_dir = str(StarTools.get_data_dir("astrbot_plugin_xbox"))
         self.known_games_path = os.path.join(self.data_dir, "known_games.json")
         self.discovery_path = os.path.join(self.data_dir, "new_discovery.json")
         self.last_pushed_path = os.path.join(self.data_dir, "last_pushed_games.json")
@@ -49,7 +48,7 @@ class XGPNotifyPlugin(Star):
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception as e:
+            except (json.JSONDecodeError, OSError) as e:
                 logger.error(f"Failed to load {path}: {e}")
         return []
 
@@ -83,6 +82,115 @@ class XGPNotifyPlugin(Star):
                 seen.add(gid)
         return unique_ids
 
+    def _parse_product(self, product: dict, pc_ids: set = None, console_ids: set = None) -> dict | None:
+        """Parse a single product from the catalog API response."""
+        pid = product.get("ProductId", "unknown")
+        try:
+            lp_list = product.get("LocalizedProperties") or []
+            if not lp_list:
+                return None
+            lp = lp_list[0]
+            
+            title = lp.get("ProductTitle") or lp.get("ShortTitle") or "Unknown"
+            desc = lp.get("ProductDescription") or lp.get("ShortDescription") or ""
+            publisher = lp.get("PublisherName") or "Unknown"
+            
+            # Extract poster image URL
+            image_url = ""
+            images = lp.get("Images") or []
+            for props in images:
+                if props and props.get("ImagePurpose") == "Poster":
+                    img_uri = props.get("Uri")
+                    if img_uri:
+                        image_url = "https:" + img_uri
+                        break
+            if not image_url and images:
+                first_img = images[0]
+                if first_img and isinstance(first_img, dict):
+                    img_uri = first_img.get("Uri")
+                    if img_uri:
+                        image_url = "https:" + img_uri
+            
+            # Detect Chinese language support
+            has_zh = self._detect_chinese_support(product)
+            
+            # Extract subscription tiers
+            tiers = self._extract_tiers(product)
+            tier_str = " · ".join(tiers) if tiers else "ULTIMATE"
+            
+            # Determine platform tags
+            platform_str = self._determine_platforms(product, pid, pc_ids, console_ids)
+
+            return {
+                "id": pid,
+                "title": title,
+                "description": desc,
+                "publisher": publisher,
+                "image_url": image_url,
+                "has_zh": has_zh,
+                "platforms": platform_str,
+                "tier": tier_str
+            }
+        except Exception as e:
+            logger.error(f"Error parsing product {pid}: {e}")
+            return None
+
+    def _detect_chinese_support(self, product: dict) -> bool:
+        """Check if a product supports Chinese language."""
+        # 1. Check top-level MarketProperties
+        market_props = product.get("MarketProperties") or []
+        for mp in market_props:
+            supported_langs = mp.get("SupportedLanguages") or []
+            if any("zh" in str(lang).lower() for lang in supported_langs):
+                return True
+        
+        # 2. Check DisplaySkuAvailabilities
+        sku_avails = product.get("DisplaySkuAvailabilities") or []
+        for sa in sku_avails:
+            sku = sa.get("Sku") or {}
+            s_market_props = sku.get("MarketProperties") or []
+            for smp in s_market_props:
+                s_langs = smp.get("SupportedLanguages") or []
+                if any("zh" in str(lang).lower() for lang in s_langs):
+                    return True
+        return False
+
+    def _extract_tiers(self, product: dict) -> list[str]:
+        """Extract subscription tier information from a product."""
+        tiers = []
+        for loc_prop in (product.get("LocalizedProperties") or []):
+            elig = loc_prop.get("EligibilityProperties")
+            if elig:
+                affirmations = elig.get("Affirmations") or []
+                for aff in affirmations:
+                    desc_text = aff.get("Description", "")
+                    if "Ultimate" in desc_text and "ULTIMATE" not in tiers:
+                        tiers.append("ULTIMATE")
+                    if "Premium" in desc_text and "PREMIUM" not in tiers:
+                        tiers.append("PREMIUM")
+        return tiers
+
+    def _determine_platforms(self, product: dict, pid: str, pc_ids: set = None, console_ids: set = None) -> str:
+        """Determine platform tags for a product."""
+        p_tags = []
+        is_pc = (pc_ids is not None and pid in pc_ids)
+        is_xbox = (console_ids is not None and pid in console_ids)
+        
+        xbox_props = (product.get("Properties") or {})
+        xbox_gen = xbox_props.get("XboxConsoleGenOptimized") or []
+        has_gen9 = "ConsoleGen9" in xbox_gen
+        
+        if is_xbox:
+            if has_gen9 and "ConsoleGen8" not in xbox_gen:
+                p_tags.append("Xbox Series X|S")
+            else:
+                p_tags.append("主机")
+        
+        if is_pc:
+            p_tags.append("PC")
+            
+        return " · ".join(p_tags) if p_tags else "主机 · PC"
+
     async def _fetch_game_details(self, game_ids: list[str], pc_ids: set = None, console_ids: set = None) -> list[dict]:
         """Fetch detailed information for a list of game IDs."""
         if not game_ids:
@@ -96,102 +204,14 @@ class XGPNotifyPlugin(Star):
             
             try:
                 resp = await self.client.get(url)
-                if resp.status_code != 200: continue
+                if resp.status_code != 200:
+                    continue
                 data = resp.json()
                 products = data.get("Products", [])
                 for product in products:
-                    pid = product.get("ProductId", "unknown")
-                    try:
-                        lp_list = product.get("LocalizedProperties") or []
-                        if not lp_list: continue
-                        lp = lp_list[0]
-                        
-                        title = lp.get("ProductTitle") or lp.get("ShortTitle") or "Unknown"
-                        desc = lp.get("ProductDescription") or lp.get("ShortDescription") or ""
-                        publisher = lp.get("PublisherName") or "Unknown"
-                        
-                        image_url = ""
-                        images = lp.get("Images") or []
-                        for props in images:
-                            if props and props.get("ImagePurpose") == "Poster":
-                                img_uri = props.get("Uri")
-                                if img_uri:
-                                    image_url = "https:" + img_uri
-                                    break
-                        if not image_url and images:
-                            first_img = images[0]
-                            if first_img and isinstance(first_img, dict):
-                                img_uri = first_img.get("Uri")
-                                if img_uri:
-                                    image_url = "https:" + img_uri
-                                
-                        has_zh = False
-                        # 1. Check top-level MarketProperties
-                        market_props = product.get("MarketProperties") or []
-                        for mp in market_props:
-                            supported_langs = mp.get("SupportedLanguages") or []
-                            if any("zh" in str(lang).lower() for lang in supported_langs):
-                                has_zh = True
-                                break
-                        
-                        # 2. Check DisplaySkuAvailabilities (often contains more detailed language data)
-                        if not has_zh:
-                            sku_avails = product.get("DisplaySkuAvailabilities") or []
-                            for sa in sku_avails:
-                                sku = sa.get("Sku") or {}
-                                s_market_props = sku.get("MarketProperties") or []
-                                for smp in s_market_props:
-                                    s_langs = smp.get("SupportedLanguages") or []
-                                    if any("zh" in str(lang).lower() for lang in s_langs):
-                                        has_zh = True
-                                        break
-                                if has_zh: break
-                            
-                        tiers = []
-                        for loc_prop in (product.get("LocalizedProperties") or []):
-                            elig = loc_prop.get("EligibilityProperties")
-                            if elig:
-                                affirmations = elig.get("Affirmations") or []
-                                for aff in affirmations:
-                                    desc_text = aff.get("Description", "")
-                                    if "Ultimate" in desc_text and "ULTIMATE" not in tiers:
-                                        tiers.append("ULTIMATE")
-                                    if "Premium" in desc_text and "PREMIUM" not in tiers:
-                                        tiers.append("PREMIUM")
-                        
-                        tier_str = " · ".join(tiers) if tiers else "ULTIMATE"
-                        
-                        p_tags = []
-                        is_pc = (pc_ids is not None and pid in pc_ids)
-                        is_xbox = (console_ids is not None and pid in console_ids)
-                        
-                        xbox_props = (product.get("Properties") or {})
-                        xbox_gen = xbox_props.get("XboxConsoleGenOptimized") or []
-                        has_gen9 = "ConsoleGen9" in xbox_gen
-                        
-                        if is_xbox:
-                            if has_gen9 and "ConsoleGen8" not in xbox_gen:
-                                p_tags.append("Xbox Series X|S")
-                            else:
-                                p_tags.append("主机")
-                        
-                        if is_pc:
-                            p_tags.append("PC")
-                            
-                        platform_str = " · ".join(p_tags) if p_tags else "主机 · PC"
-
-                        details.append({
-                            "id": pid,
-                            "title": title,
-                            "description": desc,
-                            "publisher": publisher,
-                            "image_url": image_url,
-                            "has_zh": has_zh,
-                            "platforms": platform_str,
-                            "tier": tier_str
-                        })
-                    except Exception as e:
-                        logger.error(f"Error parsing product {pid}: {e}")
+                    parsed = self._parse_product(product, pc_ids, console_ids)
+                    if parsed:
+                        details.append(parsed)
             except Exception as e:
                 logger.error(f"Failed to fetch batch {ids_str}: {e}")
         return details
@@ -208,7 +228,8 @@ class XGPNotifyPlugin(Star):
                     "4942cf41-9492-4113-ac0c-25089304323c"  # New on Console
                 ]
                 
-                all_current_ids = set()
+                all_current_ids_ordered = []
+                all_current_ids_seen = set()
                 official_recent_ordered = []
                 
                 # Fetch baseline libraries
@@ -220,29 +241,36 @@ class XGPNotifyPlugin(Star):
                     m_console = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], mkt)
                     m_new = await self._fetch_gamepass_lists(official_new_lists, mkt)
                     
-                    all_current_ids.update(m_pc)
-                    all_current_ids.update(m_console)
+                    for gid in m_pc:
+                        if gid not in all_current_ids_seen:
+                            all_current_ids_ordered.append(gid)
+                            all_current_ids_seen.add(gid)
+                    for gid in m_console:
+                        if gid not in all_current_ids_seen:
+                            all_current_ids_ordered.append(gid)
+                            all_current_ids_seen.add(gid)
                     
                     for nid in m_new:
                         if nid not in official_recent_ordered:
                             official_recent_ordered.append(nid)
 
-                new_ids = [gid for gid in all_current_ids if gid not in self.known_games_set]
+                new_ids = [gid for gid in all_current_ids_ordered if gid not in self.known_games_set]
                 
                 # Update discovery storage (remove games that left)
-                self.new_discovery = [gid for gid in self.new_discovery if gid in all_current_ids]
+                self.new_discovery = [gid for gid in self.new_discovery if gid in all_current_ids_seen]
                 
                 if not self.known_games_list:
                     # Initial baseline
-                    self.known_games_list = list(all_current_ids)
-                    self.known_games_set = set(all_current_ids)
+                    self.known_games_list = list(all_current_ids_ordered)
+                    self.known_games_set = set(all_current_ids_ordered)
                     self._save_json_list(self.known_games_path, self.known_games_list)
                     self.new_discovery = official_recent_ordered[:50]
                 elif new_ids:
                     logger.info(f"Background check found {len(new_ids)} new shadow-drops.")
                     self.known_games_list = list(new_ids) + self.known_games_list
-                    if len(self.known_games_list) > 1000: self.known_games_list = self.known_games_list[:1000]
-                    self.known_games_set.update(new_ids)
+                    if len(self.known_games_list) > 1000:
+                        self.known_games_list = self.known_games_list[:1000]
+                    self.known_games_set = set(self.known_games_list)
                     self._save_json_list(self.known_games_path, self.known_games_list)
                     
                     # Prepend discovered IDs to discovery list
@@ -252,12 +280,16 @@ class XGPNotifyPlugin(Star):
                     self.new_discovery = self.new_discovery[:200]
                 
                 # Merge official new ranking into discovery list for comprehensive tracking
+                discovery_set = set(self.new_discovery)
                 for gid in official_recent_ordered:
-                    if gid not in self.new_discovery:
+                    if gid not in discovery_set:
                         self.new_discovery.append(gid)
+                        discovery_set.add(gid)
                 self.new_discovery = self.new_discovery[:200]
                 self._save_json_list(self.discovery_path, self.new_discovery)
                 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Error in background check: {e}")
             await asyncio.sleep(self.check_interval_seconds)
@@ -271,8 +303,8 @@ class XGPNotifyPlugin(Star):
                 continue
             
             try:
-                iter = croniter(cron_expr, datetime.now())
-                next_time = iter.get_next(datetime)
+                cron_iter = croniter(cron_expr, datetime.now())
+                next_time = cron_iter.get_next(datetime)
                 wait_seconds = (next_time - datetime.now()).total_seconds()
                 
                 if wait_seconds > 0:
@@ -281,6 +313,8 @@ class XGPNotifyPlugin(Star):
                 
                 await self._perform_scheduled_push()
                 
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.error(f"Cron loop error: {e}")
                 await asyncio.sleep(60)
@@ -339,19 +373,33 @@ class XGPNotifyPlugin(Star):
                 self._save_json_list(self.last_pushed_path, self.last_pushed_games)
                 
                 await asyncio.sleep(5)
-                try: os.remove(temp_path)
-                except: pass
+                try:
+                    os.remove(temp_path)
+                except OSError as e:
+                    logger.debug(f"Failed to remove temp file {temp_path}: {e}")
         except Exception as e:
             logger.error(f"Scheduled push failed: {e}")
 
     @filter.command("xgp")
     async def xgp(self, event: AstrMessageEvent):
         '''查看最近入库的 Game Pass 游戏'''
+        async for result in self._handle_xgp_query(event):
+            yield result
+
+    @filter.regex(r"^xgp$")
+    async def xgp_no_prefix(self, event: AstrMessageEvent):
+        '''无前缀触发 xgp 查询'''
+        if not self.config.get("no_prefix_trigger", False):
+            return
+        async for result in self._handle_xgp_query(event):
+            yield result
+
+    async def _handle_xgp_query(self, event: AstrMessageEvent):
+        '''查询 Game Pass 入库信息的核心逻辑'''
         if self.config.get("show_loading_msg", True):
             yield event.plain_result("正在获取Xbox Game Pass 入库信息，请稍后...")
         
         try:
-            # Trigger a quick library member fetch for the command context
             pc_ids = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US")
             console_ids = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US")
             all_lib = set(pc_ids) | set(console_ids)
@@ -375,17 +423,27 @@ class XGPNotifyPlugin(Star):
                     temp_path = tmp.name
                 yield event.image_result(temp_path)
                 await asyncio.sleep(2)
-                try: os.remove(temp_path)
-                except: pass
+                try:
+                    os.remove(temp_path)
+                except OSError as e:
+                    logger.debug(f"Failed to remove temp file {temp_path}: {e}")
             else:
                 yield event.plain_result(f"获取图片失败，共找到 {len(details)} 个游戏。")
         except Exception as e:
-            logger.error(f"xgp new failed: {e}")
+            logger.error(f"xgp query failed: {e}")
             yield event.plain_result(f"❌ 运行失败: {e}")
 
     async def terminate(self):
         '''插件卸载时关闭后台任务。'''
-        if self.poll_task: self.poll_task.cancel()
-        if self.cron_task: self.cron_task.cancel()
+        tasks_to_cancel = []
+        if self.poll_task and not self.poll_task.done():
+            self.poll_task.cancel()
+            tasks_to_cancel.append(self.poll_task)
+        if self.cron_task and not self.cron_task.done():
+            self.cron_task.cancel()
+            tasks_to_cancel.append(self.cron_task)
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
         await self.client.aclose()
+        await self.image_gen.close()
         logger.info("XGP 插件已卸载，清理完毕。")
