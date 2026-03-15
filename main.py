@@ -47,7 +47,10 @@ class XGPNotifyPlugin(Star):
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return [item for item in data if isinstance(item, str)]
+                logger.warning(f"Expected list in {path}, got {type(data).__name__}")
             except (json.JSONDecodeError, OSError) as e:
                 logger.error(f"Failed to load {path}: {e}")
         return []
@@ -192,28 +195,36 @@ class XGPNotifyPlugin(Star):
         return " · ".join(p_tags) if p_tags else "主机 · PC"
 
     async def _fetch_game_details(self, game_ids: list[str], pc_ids: set = None, console_ids: set = None) -> list[dict]:
-        """Fetch detailed information for a list of game IDs."""
+        """Fetch detailed information for a list of game IDs (concurrent batches)."""
         if not game_ids:
             return []
-            
-        details = []
-        for i in range(0, len(game_ids), 20):
-            batch = game_ids[i:i+20]
+
+        sem = asyncio.Semaphore(3)
+
+        async def fetch_batch(batch: list[str]) -> list[dict]:
             ids_str = ",".join(batch)
             url = f"https://displaycatalog.mp.microsoft.com/v7.0/products?bigIds={ids_str}&market=CN&languages=zh-CN,en-US"
-            
-            try:
-                resp = await self.client.get(url)
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
-                products = data.get("Products", [])
-                for product in products:
-                    parsed = self._parse_product(product, pc_ids, console_ids)
-                    if parsed:
-                        details.append(parsed)
-            except Exception as e:
-                logger.error(f"Failed to fetch batch {ids_str}: {e}")
+            async with sem:
+                try:
+                    resp = await self.client.get(url)
+                    if resp.status_code != 200:
+                        return []
+                    data = resp.json()
+                    results = []
+                    for product in data.get("Products", []):
+                        parsed = self._parse_product(product, pc_ids, console_ids)
+                        if parsed:
+                            results.append(parsed)
+                    return results
+                except Exception as e:
+                    logger.error(f"Failed to fetch batch {ids_str}: {e}")
+                    return []
+
+        batches = [game_ids[i:i+20] for i in range(0, len(game_ids), 20)]
+        batch_results = await asyncio.gather(*(fetch_batch(b) for b in batches))
+        details = []
+        for batch_list in batch_results:
+            details.extend(batch_list)
         return details
 
     async def _background_check(self):
@@ -267,10 +278,12 @@ class XGPNotifyPlugin(Star):
                     self.new_discovery = official_recent_ordered[:50]
                 elif new_ids:
                     logger.info(f"Background check found {len(new_ids)} new shadow-drops.")
+                    # Baseline set keeps all ever-seen IDs (never truncated)
+                    self.known_games_set.update(new_ids)
+                    # Display list is truncated for persistence size only
                     self.known_games_list = list(new_ids) + self.known_games_list
-                    if len(self.known_games_list) > 1000:
-                        self.known_games_list = self.known_games_list[:1000]
-                    self.known_games_set = set(self.known_games_list)
+                    if len(self.known_games_list) > 5000:
+                        self.known_games_list = self.known_games_list[:5000]
                     self._save_json_list(self.known_games_path, self.known_games_list)
                     
                     # Prepend discovered IDs to discovery list
@@ -335,18 +348,17 @@ class XGPNotifyPlugin(Star):
                 return
 
         logger.info(f"开始执行 XGP 定时推送，目标数: {len(targets)}")
-        
-        # We need a dummy event-like context for handle_catalog_command logic
-        # But we can just call it directly to get the image
+
+        temp_path = None
         try:
-            # Re-fetch everything to ensure accuracy
             pc_ids = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US")
             console_ids = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US")
             all_lib = set(pc_ids) | set(console_ids)
-            
-            # Use current discovery list filtered by absolute library membership
-            target_ids = [gid for gid in self.new_discovery if gid in all_lib]
-            
+
+            # Snapshot shared state for consistency
+            discovery_snapshot = list(self.new_discovery)
+            target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
+
             if not target_ids:
                 return
 
@@ -360,25 +372,25 @@ class XGPNotifyPlugin(Star):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
                     tmp.write(img_bytes)
                     temp_path = tmp.name
-                
+
                 chain = MessageChain().file_image(temp_path)
                 for umo in targets:
                     try:
                         await self.context.send_message(umo, chain)
                     except Exception as e:
                         logger.error(f"Failed to push to {umo}: {e}")
-                
-                # Update last pushed cache
-                self.last_pushed_games = list(self.new_discovery)
+
+                self.last_pushed_games = discovery_snapshot
                 self._save_json_list(self.last_pushed_path, self.last_pushed_games)
-                
+        except Exception as e:
+            logger.error(f"Scheduled push failed: {e}")
+        finally:
+            if temp_path:
                 await asyncio.sleep(5)
                 try:
                     os.remove(temp_path)
                 except OSError as e:
                     logger.debug(f"Failed to remove temp file {temp_path}: {e}")
-        except Exception as e:
-            logger.error(f"Scheduled push failed: {e}")
 
     @filter.command("xgp")
     async def xgp(self, event: AstrMessageEvent):
@@ -386,32 +398,27 @@ class XGPNotifyPlugin(Star):
         async for result in self._handle_xgp_query(event):
             yield result
 
-    @filter.regex(r"^xgp$")
-    async def xgp_no_prefix(self, event: AstrMessageEvent):
-        '''无前缀触发 xgp 查询'''
-        if not self.config.get("no_prefix_trigger", False):
-            return
-        async for result in self._handle_xgp_query(event):
-            yield result
-
     async def _handle_xgp_query(self, event: AstrMessageEvent):
         '''查询 Game Pass 入库信息的核心逻辑'''
         if self.config.get("show_loading_msg", True):
             yield event.plain_result("正在获取Xbox Game Pass 入库信息，请稍后...")
-        
+
+        temp_path = None
         try:
             pc_ids = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US")
             console_ids = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US")
             all_lib = set(pc_ids) | set(console_ids)
-            
-            target_ids = [gid for gid in self.new_discovery if gid in all_lib]
+
+            # Snapshot shared state
+            discovery_snapshot = list(self.new_discovery)
+            target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
             if not target_ids:
                 yield event.plain_result("😅 暂未发现新入库的游戏。")
                 return
 
             limit = self.config.get("display_limit", 10)
             details = await self._fetch_game_details(target_ids[:limit], set(pc_ids), set(console_ids))
-            
+
             if not details:
                 yield event.plain_result("😅 无法获取游戏详情，请稍后再试。")
                 return
@@ -422,16 +429,18 @@ class XGPNotifyPlugin(Star):
                     tmp.write(img_bytes)
                     temp_path = tmp.name
                 yield event.image_result(temp_path)
-                await asyncio.sleep(2)
-                try:
-                    os.remove(temp_path)
-                except OSError as e:
-                    logger.debug(f"Failed to remove temp file {temp_path}: {e}")
             else:
                 yield event.plain_result(f"获取图片失败，共找到 {len(details)} 个游戏。")
         except Exception as e:
             logger.error(f"xgp query failed: {e}")
             yield event.plain_result(f"❌ 运行失败: {e}")
+        finally:
+            if temp_path:
+                await asyncio.sleep(2)
+                try:
+                    os.remove(temp_path)
+                except OSError as e:
+                    logger.debug(f"Failed to remove temp file {temp_path}: {e}")
 
     async def terminate(self):
         '''插件卸载时关闭后台任务。'''

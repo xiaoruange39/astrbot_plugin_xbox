@@ -12,14 +12,16 @@ from astrbot.api import logger
 XGP_GREEN = "#0f7e17" # Deeper official green background
 WHITE = "#FFFFFF"
 LIGHT_GREEN = "#9bf00b" # Bright green for platforms
-BADGE_GREEN = "#00a300" 
+BADGE_GREEN = "#00a300"
+
+
 class XGPImageGenerator:
     def __init__(self):
         self.font_path = self._find_chinese_font()
         self.client = httpx.AsyncClient(timeout=20.0)
         self._download_semaphore = asyncio.Semaphore(6)
         # Adjusted font sizes per user feedback
-        self.font_title = self._get_font(70) 
+        self.font_title = self._get_font(70)
         self.font_game_title = self._get_font(34)
         self.font_platform = self._get_font(22)
         self.font_tier = self._get_font(20) # Subscription tier label
@@ -140,12 +142,27 @@ class XGPImageGenerator:
                 pass
         return ImageFont.load_default()
 
-    async def _download_image(self, url: str) -> Image.Image:
+    async def _download_image(self, url: str) -> "Image.Image | None":
+        """Download and open an image with size and pixel safeguards."""
+        max_content_bytes = 10 * 1024 * 1024  # 10 MB
+        max_pixels = 25_000_000  # 25 MP
         try:
             async with self._download_semaphore:
                 resp = await self.client.get(url)
                 resp.raise_for_status()
-                return Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                content_len = resp.headers.get("content-length")
+                if content_len and int(content_len) > max_content_bytes:
+                    logger.debug(f"Image too large ({content_len} bytes), skipping: {url}")
+                    return None
+                if len(resp.content) > max_content_bytes:
+                    logger.debug(f"Image body too large ({len(resp.content)} bytes), skipping: {url}")
+                    return None
+                img = Image.open(io.BytesIO(resp.content))
+                w, h = img.size
+                if w * h > max_pixels:
+                    logger.debug(f"Image pixel count too high ({w}x{h}), skipping: {url}")
+                    return None
+                return img.convert("RGBA")
         except httpx.HTTPError as e:
             logger.debug(f"Failed to download image {url}: {e}")
             return None
@@ -189,7 +206,7 @@ class XGPImageGenerator:
         """
         num_games = len(games)
         if num_games == 0:
-             return b""
+            return b""
 
         # Fetch all images concurrently (I/O bound, stays in event loop)
         async def fetch_poster(game):
@@ -201,7 +218,13 @@ class XGPImageGenerator:
                         return img
             return None
             
-        posters_raw = await asyncio.gather(*(fetch_poster(g) for g in games))
+        posters_raw = await asyncio.gather(
+            *(fetch_poster(g) for g in games), return_exceptions=True
+        )
+        # Replace exceptions with None so rendering can continue
+        posters_raw = [
+            p if isinstance(p, Image.Image) else None for p in posters_raw
+        ]
         
         # Offload CPU-intensive Pillow rendering to a thread
         return await asyncio.to_thread(self._render_image, title, games, posters_raw)
@@ -251,8 +274,9 @@ class XGPImageGenerator:
                 # Fallback placeholder
                 poster = Image.new("RGBA", (poster_w, poster_h), "#333333")
                 d = ImageDraw.Draw(poster)
-                v_box = d.textbbox((0,0), "加载失败", font=self.font_game_title)
-                d.text(((poster_w - (v_box[2]-v_box[0]))//2, (poster_h - (v_box[3]-v_box[1]))//2), "无封面", font=self.font_game_title, fill=WHITE)
+                placeholder = "无封面"
+                v_box = d.textbbox((0, 0), placeholder, font=self.font_game_title)
+                d.text(((poster_w - (v_box[2]-v_box[0]))//2, (poster_h - (v_box[3]-v_box[1]))//2), placeholder, font=self.font_game_title, fill=WHITE)
             
             # Add rounded corners to poster
             poster = self._add_rounded_corners(poster, 16)

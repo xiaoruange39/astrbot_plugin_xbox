@@ -5,12 +5,6 @@
         "default": 10,
         "hint": "设置每次手动查询 (/xgp) 或定时推送时显示的游戏海报数量，建议 1-36 之间。"
     },
-    "no_prefix_trigger": {
-        "description": "无需前缀触发",
-        "type": "bool",
-        "default": false,
-        "hint": "开启后，直接发送 xgp 即可触发查询，无需输入 /xgp 前缀。"
-    },
     "show_loading_msg": {
         "description": "显示加载提示",
         "type": "bool",
