@@ -105,14 +105,14 @@ class XGPNotifyPlugin(Star):
                 if props and props.get("ImagePurpose") == "Poster":
                     img_uri = props.get("Uri")
                     if img_uri:
-                        image_url = "https:" + img_uri
+                        image_url = img_uri if img_uri.startswith("http") else "https:" + img_uri
                         break
             if not image_url and images:
                 first_img = images[0]
                 if first_img and isinstance(first_img, dict):
                     img_uri = first_img.get("Uri")
                     if img_uri:
-                        image_url = "https:" + img_uri
+                        image_url = img_uri if img_uri.startswith("http") else "https:" + img_uri
             
             # Detect Chinese language support
             has_zh = self._detect_chinese_support(product)
@@ -331,15 +331,24 @@ class XGPNotifyPlugin(Star):
                 logger.error(f"Cron loop error: {e}")
                 await asyncio.sleep(60)
 
-    async def _fetch_all_library_ids(self) -> set[str]:
-        """Fetch PC + Console IDs across all tracked markets for accurate filtering."""
+    async def _fetch_all_library_ids(self) -> tuple[set[str], set[str], set[str]]:
+        """Fetch PC + Console IDs across all tracked markets for accurate filtering.
+
+        Returns:
+            (all_ids, us_pc_ids, us_console_ids)
+        """
         all_ids: set[str] = set()
+        us_pc_ids: set[str] = set()
+        us_console_ids: set[str] = set()
         for mkt in ["US", "HK", "CN"]:
             pc = await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], mkt)
             console = await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], mkt)
             all_ids.update(pc)
             all_ids.update(console)
-        return all_ids
+            if mkt == "US":
+                us_pc_ids = set(pc)
+                us_console_ids = set(console)
+        return all_ids, us_pc_ids, us_console_ids
 
     async def _perform_scheduled_push(self):
         """执行定时推送逻辑"""
@@ -358,9 +367,7 @@ class XGPNotifyPlugin(Star):
 
         temp_path = None
         try:
-            all_lib = await self._fetch_all_library_ids()
-            pc_ids = set(await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US"))
-            console_ids = set(await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US"))
+            all_lib, pc_ids, console_ids = await self._fetch_all_library_ids()
 
             discovery_snapshot = list(self.new_discovery)
             target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
@@ -411,9 +418,7 @@ class XGPNotifyPlugin(Star):
 
         temp_path = None
         try:
-            all_lib = await self._fetch_all_library_ids()
-            pc_ids = set(await self._fetch_gamepass_lists([XGP_ALL_PC_GAMES], "US"))
-            console_ids = set(await self._fetch_gamepass_lists([XGP_ALL_CONSOLE_GAMES], "US"))
+            all_lib, pc_ids, console_ids = await self._fetch_all_library_ids()
 
             discovery_snapshot = list(self.new_discovery)
             target_ids = [gid for gid in discovery_snapshot if gid in all_lib]
