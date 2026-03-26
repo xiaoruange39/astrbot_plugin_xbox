@@ -5,6 +5,7 @@ import asyncio
 import os
 import subprocess
 import platform
+from dataclasses import dataclass
 from urllib.parse import urlparse
 from PIL import Image, ImageDraw, ImageFont
 from astrbot.api import logger
@@ -28,11 +29,108 @@ LIGHT_GREEN = "#9bf00b" # Bright green for platforms
 BADGE_GREEN = "#00a300"
 
 
+@dataclass(frozen=True)
+class RenderLayout:
+    """UI layout constants for announcement image rendering."""
+    poster_w: int = 300
+    poster_h: int = 450
+    spacing: int = 80
+    padding_top: int = 320
+    padding_bottom: int = 420
+    padding_side: int = 120
+    items_per_row_max: int = 6
+    title_y: int = 90
+    title_below_poster: int = 30
+    tier_below_poster: int = 85
+    platform_below_tier: int = 35
+    poster_corner_radius: int = 16
+    border_radius: int = 18
+    poster_border_width: int = 2
+    badge_logo_w: int = 220
+    badge_logo_h: int = 176
+    badge_logo_radius: int = 24
+    badge_offset_x: int = 40
+    badge_offset_y: int = 200
+    badge_icon_center_y: int = 48
+    badge_xbox_text_y: int = 88
+    badge_gp_text_y: int = 123
+    row_gap: int = 220
+    zh_badge_pad_h: int = 24
+    zh_badge_pad_v: int = 10
+    zh_badge_margin_bottom: int = 10
+    zh_badge_slant: int = 20
+    footer_bottom_margin: int = 40
+
+def find_chinese_font():
+    """Locate a Chinese-capable font on the system.
+
+    Note: This runs synchronous subprocess calls, but is only invoked once
+    at module/class init time, not on the hot request path.
+    """
+    # 1. Check local directory first
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    for local_font in ["font.ttf", "font.ttc", "font.otf"]:
+        p = os.path.join(current_dir, local_font)
+        if os.path.exists(p):
+            return p
+
+    # 2. Try using fc-list on Linux/macOS to find ANY font supporting Chinese
+    if platform.system() != "Windows":
+        try:
+            result = subprocess.run(
+                ['fc-list', ':lang=zh', 'file'],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0 and result.stdout:
+                fonts = result.stdout.strip().split('\n')
+                for line in fonts:
+                    file_path = line.split(':')[0].strip()
+                    if file_path.lower().endswith(('.ttf', '.ttc', '.otf')):
+                        if os.path.exists(file_path):
+                            return file_path
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.debug(f"fc-list font search failed: {e}")
+
+    # 3. Fallback to hardcoded common paths if fc-list fails or on Windows
+    common_fonts = [
+        # Windows
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyhbd.ttc",
+        "C:/Windows/Fonts/simhei.ttf",
+        # macOS
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Light.ttc",
+        # Common Linux
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"
+    ]
+    for path in common_fonts:
+        if os.path.exists(path):
+            return path
+
+    # 4. Final desperate fallback -> try to just load by generic name
+    for name in ["msyh.ttc", "simhei.ttf", "NotoSansCJK-Regular.ttc"]:
+        try:
+            ImageFont.truetype(name, 10)
+            return name
+        except IOError:
+            pass
+
+    logger.warning("Absolutely no Chinese font could be found on your system!")
+    return None
+
+
 class XGPImageGenerator:
     def __init__(self):
-        self.font_path = self._find_chinese_font()
-        self.client = httpx.AsyncClient(timeout=20.0)
+        self.font_path = find_chinese_font()
+        self._client: httpx.AsyncClient | None = None
         self._download_semaphore = asyncio.Semaphore(6)
+        self._render_sem = asyncio.Semaphore(2)  # Limit concurrent render threads
+        self.layout = RenderLayout()
         # Adjusted font sizes per user feedback
         self.font_title = self._get_font(70)
         self.font_game_title = self._get_font(34)
@@ -59,12 +157,23 @@ class XGPImageGenerator:
                         new_data.append(item)
                 img_logo.putdata(new_data)
                 self.xbox_icon = img_logo.resize((75, 75), Image.Resampling.LANCZOS)
+                img_logo.close()
             except (OSError, ValueError) as e:
                 logger.debug(f"Failed to load Xbox logo: {e}")
 
+    @property
+    def client(self) -> httpx.AsyncClient:
+        """Lazy-initialized async HTTP client (safe across event loop lifecycles)."""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=20.0)
+        return self._client
+
     async def close(self):
-        """Close the shared HTTP client."""
-        await self.client.aclose()
+        """Close the shared HTTP client and free internal icon memory."""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        if self.xbox_icon:
+            self.xbox_icon.close()
 
     def _draw_vertical_gradient(self, width, height, top_hex, bottom_hex):
         base = Image.new("RGBA", (width, height))
@@ -86,66 +195,6 @@ class XGPImageGenerator:
             draw.line([(0, y), (width, y)], fill=(r, g, b, 255))
         return base
 
-    def _find_chinese_font(self):
-        # 1. Check local directory first
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        for local_font in ["font.ttf", "font.ttc", "font.otf"]:
-            p = os.path.join(current_dir, local_font)
-            if os.path.exists(p):
-                return p
-                
-        # 2. Try using fc-list on Linux/macOS to find ANY font supporting Chinese
-        if platform.system() != "Windows":
-            try:
-                # Ask fontconfig for fonts supporting Chinese (lang=zh)
-                result = subprocess.run(
-                    ['fc-list', ':lang=zh', 'file'],
-                    capture_output=True, text=True, timeout=3
-                )
-                if result.returncode == 0 and result.stdout:
-                    # Parse the first returned font file
-                    fonts = result.stdout.strip().split('\n')
-                    for line in fonts:
-                        file_path = line.split(':')[0].strip()
-                        if file_path.lower().endswith(('.ttf', '.ttc', '.otf')):
-                            if os.path.exists(file_path):
-                                return file_path
-            except (OSError, subprocess.SubprocessError) as e:
-                logger.debug(f"fc-list font search failed: {e}")
-                
-        # 3. Fallback to hardcoded common paths if fc-list fails or on Windows
-        common_fonts = [
-            # Windows
-            "C:/Windows/Fonts/msyh.ttc",
-            "C:/Windows/Fonts/msyhbd.ttc",
-            "C:/Windows/Fonts/simhei.ttf",
-            # macOS
-            "/System/Library/Fonts/PingFang.ttc",
-            "/System/Library/Fonts/STHeiti Light.ttc",
-            # Common Linux
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
-            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"
-        ]
-        
-        for path in common_fonts:
-            if os.path.exists(path):
-                return path
-                
-        # 4. Final desperate fallback -> try to just load by generic name (often works on Windows)
-        for name in ["msyh.ttc", "simhei.ttf", "NotoSansCJK-Regular.ttc"]:
-            try:
-                # Tests if Pillow can find it in OS specific ways
-                ImageFont.truetype(name, 10)
-                return name
-            except IOError:
-                pass
-                
-        logger.warning("Absolutely no Chinese font could be found on your system!")
-        return None
 
     def _get_font(self, size):
         if self.font_path:
@@ -173,8 +222,15 @@ class XGPImageGenerator:
                 if len(resp.content) > max_content_bytes:
                     logger.debug(f"Image body too large ({len(resp.content)} bytes), skipping: {url}")
                     return None
-                img = Image.open(io.BytesIO(resp.content))
-                return img.convert("RGBA")
+                raw_img = Image.open(io.BytesIO(resp.content))
+                converted = raw_img
+                try:
+                    converted = raw_img.convert("RGBA")
+                finally:
+                    # close the original if convert() created a new object
+                    if converted is not raw_img:
+                        raw_img.close()
+                return converted
         except Image.DecompressionBombError:
             logger.warning(f"Decompression bomb detected, skipping: {url}")
             return None
@@ -186,38 +242,46 @@ class XGPImageGenerator:
             return None
 
     def _crop_to_ratio(self, img: Image.Image, target_ratio: float) -> Image.Image:
-        """Crop image to match exactly target_width/target_height ratio from the center"""
+        """Crop image to match exactly target_width/target_height ratio from the center.
+        Closes the original image if a new cropped copy is created."""
         w, h = img.size
         current_ratio = w / h
-        
+
         if current_ratio > target_ratio:
-            # Too wide, crop width
             new_w = int(h * target_ratio)
             left = (w - new_w) // 2
-            return img.crop((left, 0, left + new_w, h))
+            cropped = img.crop((left, 0, left + new_w, h))
+            img.close()
+            return cropped
         elif current_ratio < target_ratio:
-            # Too tall, crop height
             new_h = int(w / target_ratio)
             top = (h - new_h) // 2
-            return img.crop((0, top, w, top + new_h))
+            cropped = img.crop((0, top, w, top + new_h))
+            img.close()
+            return cropped
         return img
 
     def _add_rounded_corners(self, img: Image.Image, radius: int) -> Image.Image:
-        """Add rounded corners to an image"""
+        """Add rounded corners to an image. Closes the original and intermediate mask."""
         mask = Image.new('L', img.size, 0)
         draw = ImageDraw.Draw(mask)
         draw.rounded_rectangle([(0, 0), img.size], radius=radius, fill=255)
-        
+
         result = img.copy()
         if result.mode != 'RGBA':
+            unconverted = result
             result = result.convert('RGBA')
+            unconverted.close()
         result.putalpha(mask)
+        mask.close()
+        img.close()
         return result
 
     async def generate_announcement_image(self, title: str, games: list[dict]) -> bytes:
         """
         Generate a horizontally laid out announcement image.
         Downloads images concurrently, then offloads CPU-intensive rendering to a thread.
+        All downloaded poster images are explicitly closed after rendering.
         """
         num_games = len(games)
         if num_games == 0:
@@ -232,7 +296,7 @@ class XGPImageGenerator:
                     if img:
                         return img
             return None
-            
+
         # Log and replace exceptions with None so rendering can continue
         posters_raw = []
         for i, p in enumerate(await asyncio.gather(
@@ -245,160 +309,201 @@ class XGPImageGenerator:
                 posters_raw.append(p)
             else:
                 posters_raw.append(None)
-        
-        # Offload CPU-intensive Pillow rendering to a thread
-        return await asyncio.to_thread(self._render_image, title, games, posters_raw)
 
-    def _render_image(self, title: str, games: list[dict], posters_raw: list) -> bytes:
-        """CPU-intensive image rendering, runs in a thread pool."""
-        num_games = len(games)
-        
-        # Standard poster size inside the layout
-        poster_w, poster_h = 300, 450
-        spacing = 80
-        padding_top = 320
-        padding_bottom = 420
-        padding_side = 120
-        
-        # Max 6 items per row for visual clarity
-        items_per_row = min(num_games, 6)
-        num_rows = math.ceil(num_games / items_per_row)
-        
-        img_w = padding_side * 2 + items_per_row * poster_w + (items_per_row - 1) * spacing
-        img_h = padding_top + padding_bottom + num_rows * poster_h + (num_rows - 1) * 220
-        
-        # Create base image with gradient
-        base_img = self._draw_vertical_gradient(int(img_w), int(img_h), XGP_GREEN, "#084d08")
-        draw = ImageDraw.Draw(base_img)
-        
-        # Draw main title centered
-        title_bbox = draw.textbbox((0, 0), title, font=self.font_title)
-        title_w = title_bbox[2] - title_bbox[0]
-        title_x = (img_w - title_w) // 2
-        draw.text((title_x, 90), title, font=self.font_title, fill=WHITE, stroke_width=2)
-        
-        # Draw games
-        for idx, game in enumerate(games):
-            row = idx // items_per_row
-            col = idx % items_per_row
-            
-            x = padding_side + col * (poster_w + spacing)
-            y = padding_top + row * (poster_h + 220)
-            
-            # Process poster
-            raw_img = posters_raw[idx]
-            if raw_img:
-                poster = self._crop_to_ratio(raw_img, 2/3)
-                poster = poster.resize((poster_w, poster_h), Image.Resampling.LANCZOS)
+        # Offload CPU-intensive Pillow rendering to a thread (bounded concurrency)
+        # _render_image is responsible for closing all poster images in posters_raw
+        try:
+            async with self._render_sem:
+                return await asyncio.to_thread(self._render_image, title, games, posters_raw)
+        except Exception:
+            # If rendering thread failed to start, clean up posters here
+            for img in posters_raw:
+                if img is not None:
+                    img.close()
+            raise
+
+    def _draw_game_card(self, draw: ImageDraw.Draw, base_img: Image.Image,
+                        game: dict, poster_raw: "Image.Image | None", x: int, y: int):
+        """Draw a single game card: poster, title, tier label, and platform text."""
+        L = self.layout
+        bw = L.poster_border_width
+
+        poster = None
+        try:
+            if poster_raw:
+                poster = self._crop_to_ratio(poster_raw, 2 / 3)
+                resized = poster.resize((L.poster_w, L.poster_h), Image.Resampling.LANCZOS)
+                poster.close()
+                poster = resized
             else:
-                # Fallback placeholder
-                poster = Image.new("RGBA", (poster_w, poster_h), "#333333")
+                poster = Image.new("RGBA", (L.poster_w, L.poster_h), "#333333")
                 d = ImageDraw.Draw(poster)
                 placeholder = "无封面"
                 v_box = d.textbbox((0, 0), placeholder, font=self.font_game_title)
-                d.text(((poster_w - (v_box[2]-v_box[0]))//2, (poster_h - (v_box[3]-v_box[1]))//2), placeholder, font=self.font_game_title, fill=WHITE)
-            
-            # Add rounded corners to poster
-            poster = self._add_rounded_corners(poster, 16)
-            
-            # Draw a thin white border behind the poster
-            draw.rounded_rectangle([x - 2, y - 2, x + poster_w + 2, y + poster_h + 2], radius=18, fill=WHITE)
+                d.text(
+                    ((L.poster_w - (v_box[2] - v_box[0])) // 2, (L.poster_h - (v_box[3] - v_box[1])) // 2),
+                    placeholder, font=self.font_game_title, fill=WHITE,
+                )
+
+            poster = self._add_rounded_corners(poster, L.poster_corner_radius)
+            draw.rounded_rectangle(
+                [x - bw, y - bw, x + L.poster_w + bw, y + L.poster_h + bw],
+                radius=L.border_radius, fill=WHITE,
+            )
             base_img.paste(poster, (x, y), mask=poster)
-            # Draw "支持中文" badge overlaid on the bottom right of the poster
-            if game.get("has_zh"):
-                badge_text = "支持中文"
-                badge_bbox = draw.textbbox((0, 0), badge_text, font=self.font_badge)
-                bw, bh = badge_bbox[2] - badge_bbox[0], badge_bbox[3] - badge_bbox[1]
-                
-                banner_padding_h = 24
-                banner_padding_v = 10
-                banner_h = bh + banner_padding_v * 2
-                banner_w = bw + banner_padding_h * 2
-                
-                p_x1 = x + poster_w - banner_w
-                p_x2 = x + poster_w
-                p_y1 = y + poster_h - banner_h - 10
-                p_y2 = y + poster_h - 10
-                
-                slant = 20
-                poly = [
-                    (p_x1 + slant, p_y1),
-                    (p_x2, p_y1),
-                    (p_x2, p_y2),
-                    (p_x1, p_y2)
-                ]
-                
-                draw.polygon(poly, fill=BADGE_GREEN)
-                
-                text_center_x = p_x1 + slant + (banner_w - slant) / 2
-                text_center_y = p_y1 + banner_h / 2
-                draw.text((text_center_x, text_center_y), badge_text, font=self.font_badge, fill=WHITE, stroke_width=1, anchor="mm")
-                
-            # Draw game title below poster
-            g_title = game["title"]
-            max_width = poster_w
-            if draw.textlength(g_title, font=self.font_game_title) > max_width:
-                while len(g_title) > 0 and draw.textlength(g_title + "...", font=self.font_game_title) > max_width:
-                    g_title = g_title[:-1]
-                g_title += "..."
-            draw.text((x, y + poster_h + 30), g_title, font=self.font_game_title, fill=WHITE, stroke_width=1)
-            
-            # Draw subscription tier
-            tier_text = game.get("tier", "ULTIMATE").upper()
-            if self.font_tier.getlength(tier_text) > poster_w:
-                while self.font_tier.getlength(tier_text + "...") > poster_w and len(tier_text) > 0:
+        finally:
+            if poster is not None:
+                poster.close()
+
+        # Chinese badge
+        if game.get("has_zh"):
+            self._draw_zh_badge(draw, x, y)
+
+        # Game title (truncated to poster width)
+        g_title = game["title"]
+        max_width = L.poster_w
+        if draw.textlength(g_title, font=self.font_game_title) > max_width:
+            while len(g_title) > 0 and draw.textlength(g_title + "...", font=self.font_game_title) > max_width:
+                g_title = g_title[:-1]
+            g_title += "..."
+        draw.text((x, y + L.poster_h + L.title_below_poster), g_title, font=self.font_game_title, fill=WHITE, stroke_width=1)
+
+        # Subscription tier
+        tier_text = game.get("tier", "ULTIMATE").upper()
+        tier_font = self.font_tier
+        if draw.textlength(tier_text, font=tier_font) > L.poster_w:
+            if " \u00b7 " in tier_text:
+                temp_font = self._get_font(18)
+                if draw.textlength(tier_text, font=temp_font) <= L.poster_w:
+                    tier_font = temp_font
+            if draw.textlength(tier_text, font=tier_font) > L.poster_w:
+                while draw.textlength(tier_text + "...", font=tier_font) > L.poster_w and len(tier_text) > 0:
                     tier_text = tier_text[:-1]
                 tier_text += "..."
-                
-            tier_y = y + poster_h + 85
-            draw.text((x, tier_y), tier_text, font=self.font_tier, fill=WHITE)
-            
-            # Draw platforms
-            platform_text = game.get("platforms", "主机")
-            platform_text = platform_text.replace("主机", "主 机")
-            
-            if draw.textlength(platform_text, font=self.font_platform) > poster_w:
-                while draw.textlength(platform_text + "...", font=self.font_platform) > poster_w and len(platform_text) > 0:
-                    platform_text = platform_text[:-1]
-                platform_text += "..."
+        tier_y = y + L.poster_h + L.tier_below_poster
+        draw.text((x, tier_y), tier_text, font=tier_font, fill=WHITE)
 
-            platform_y = tier_y + 35
-            draw.text((x, platform_y), platform_text, font=self.font_platform, fill=LIGHT_GREEN, stroke_width=1)
+        # Platforms
+        platform_text = game.get("platforms", "主机").replace("主机", "主 机")
+        if draw.textlength(platform_text, font=self.font_platform) > L.poster_w:
+            while draw.textlength(platform_text + "...", font=self.font_platform) > L.poster_w and len(platform_text) > 0:
+                platform_text = platform_text[:-1]
+            platform_text += "..."
+        draw.text((x, tier_y + L.platform_below_tier), platform_text, font=self.font_platform, fill=LIGHT_GREEN, stroke_width=1)
 
-        # Draw bottom right logo badge
-        badge_w, badge_h = 220, 176
-        bx = img_w - padding_side - badge_w + 40
-        by = img_h - padding_bottom + 200
-        
-        draw.rounded_rectangle([bx, by, bx + badge_w, by + badge_h], radius=24, fill=WHITE)
-        
-        cx, cy = bx + badge_w / 2, by + 48
+    def _draw_zh_badge(self, draw: ImageDraw.Draw, x: int, y: int):
+        """Draw the '支持中文' parallelogram badge on the bottom-right of a poster."""
+        L = self.layout
+        badge_text = "支持中文"
+        badge_bbox = draw.textbbox((0, 0), badge_text, font=self.font_badge)
+        b_w, b_h = badge_bbox[2] - badge_bbox[0], badge_bbox[3] - badge_bbox[1]
+
+        banner_h = b_h + L.zh_badge_pad_v * 2
+        banner_w = b_w + L.zh_badge_pad_h * 2
+
+        p_x1 = x + L.poster_w - banner_w
+        p_x2 = x + L.poster_w
+        p_y1 = y + L.poster_h - banner_h - L.zh_badge_margin_bottom
+        p_y2 = y + L.poster_h - L.zh_badge_margin_bottom
+
+        poly = [
+            (p_x1 + L.zh_badge_slant, p_y1),
+            (p_x2, p_y1),
+            (p_x2, p_y2),
+            (p_x1, p_y2)
+        ]
+        draw.polygon(poly, fill=BADGE_GREEN)
+
+        text_center_x = p_x1 + L.zh_badge_slant + (banner_w - L.zh_badge_slant) / 2
+        text_center_y = p_y1 + banner_h / 2
+        draw.text((text_center_x, text_center_y), badge_text, font=self.font_badge, fill=WHITE, stroke_width=1, anchor="mm")
+
+    def _draw_logo_badge(self, draw: ImageDraw.Draw, base_img: Image.Image, img_w: int, img_h: int):
+        """Draw the Xbox Game Pass logo badge at the bottom-right."""
+        L = self.layout
+        badge_w, badge_h = L.badge_logo_w, L.badge_logo_h
+        bx = img_w - L.padding_side - badge_w + L.badge_offset_x
+        by = img_h - L.padding_bottom + L.badge_offset_y
+
+        draw.rounded_rectangle([bx, by, bx + badge_w, by + badge_h], radius=L.badge_logo_radius, fill=WHITE)
+
+        cx, cy = bx + badge_w / 2, by + L.badge_icon_center_y
         if self.xbox_icon:
             icon_w, icon_h = self.xbox_icon.size
-            base_img.paste(self.xbox_icon, (int(cx - icon_w/2), int(cy - icon_h/2)), self.xbox_icon)
+            base_img.paste(self.xbox_icon, (int(cx - icon_w / 2), int(cy - icon_h / 2)), self.xbox_icon)
         else:
             r = 30
             draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill="#1a1a1a")
-            draw.chord([cx-r-8, cy-r-40, cx+r+8, cy+r-20], 50, 130, fill=WHITE)
-            draw.chord([cx-r-8, cy-r+20, cx+r+8, cy+r+40], 230, 310, fill=WHITE)
+            draw.chord([cx - r - 8, cy - r - 40, cx + r + 8, cy + r - 20], 50, 130, fill=WHITE)
+            draw.chord([cx - r - 8, cy - r + 20, cx + r + 8, cy + r + 40], 230, 310, fill=WHITE)
             offset = 20
-            draw.chord([cx-r-40, cy-r-10, cx+r-offset, cy+r+10], 320, 40, fill=WHITE)
-            draw.chord([cx-r+offset, cy-r-10, cx+r+40, cy+r+10], 140, 220, fill=WHITE)
-        
+            draw.chord([cx - r - 40, cy - r - 10, cx + r - offset, cy + r + 10], 320, 40, fill=WHITE)
+            draw.chord([cx - r + offset, cy - r - 10, cx + r + 40, cy + r + 10], 140, 220, fill=WHITE)
+
         xbox_w = draw.textlength("Xbox", font=self.font_logo)
-        draw.text((cx - xbox_w/2, by + 88), "Xbox", font=self.font_logo, fill="#1a1a1a", stroke_width=1)
-        
+        draw.text((cx - xbox_w / 2, by + L.badge_xbox_text_y), "Xbox", font=self.font_logo, fill="#1a1a1a", stroke_width=1)
+
         gp_text = "Game Pass"
         gp_w = draw.textlength(gp_text, font=self.font_logo)
-        draw.text((cx - gp_w/2, by + 123), gp_text, font=self.font_logo, fill="#1a1a1a", stroke_width=1)
-        
-        # Footer
-        footer = "Xbox Game Pass 入库提醒 · by xiaoruange39 · Powered by AstrBot"
+        draw.text((cx - gp_w / 2, by + L.badge_gp_text_y), gp_text, font=self.font_logo, fill="#1a1a1a", stroke_width=1)
+
+    def _draw_footer(self, draw: ImageDraw.Draw, img_w: int, img_h: int):
+        """Draw the footer text centered at the bottom."""
+        L = self.layout
+        footer = "Xbox Game Pass 入库提醒 \u00b7 by xiaoruange39 \u00b7 Powered by AstrBot"
         footer_w = draw.textlength(footer, font=self.font_footer)
-        draw.text(((img_w - footer_w) / 2, img_h - 40), footer, font=self.font_footer, fill="#88cc88")
-        
-        # Save to JPEG
-        output = io.BytesIO()
-        base_img.convert("RGB").save(output, format="JPEG", quality=85)
-        output.seek(0)
-        return output.getvalue()
+        draw.text(((img_w - footer_w) / 2, img_h - L.footer_bottom_margin), footer, font=self.font_footer, fill="#88cc88")
+
+    def _render_image(self, title: str, games: list[dict], posters_raw: list) -> bytes:
+        """CPU-intensive image rendering, runs in a thread pool.
+        Responsible for closing all images in posters_raw when done."""
+        L = self.layout
+        num_games = len(games)
+
+        items_per_row = min(num_games, L.items_per_row_max)
+        num_rows = math.ceil(num_games / items_per_row)
+
+        img_w = L.padding_side * 2 + items_per_row * L.poster_w + (items_per_row - 1) * L.spacing
+        img_h = L.padding_top + L.padding_bottom + num_rows * L.poster_h + (num_rows - 1) * L.row_gap
+
+        base_img = self._draw_vertical_gradient(int(img_w), int(img_h), XGP_GREEN, "#084d08")
+        try:
+            draw = ImageDraw.Draw(base_img)
+
+            # Draw main title centered
+            title_bbox = draw.textbbox((0, 0), title, font=self.font_title)
+            title_w = title_bbox[2] - title_bbox[0]
+            draw.text(((img_w - title_w) // 2, L.title_y), title, font=self.font_title, fill=WHITE, stroke_width=2)
+
+            # Draw game cards
+            for idx, game in enumerate(games):
+                row = idx // items_per_row
+                col = idx % items_per_row
+                x = L.padding_side + col * (L.poster_w + L.spacing)
+                y = L.padding_top + row * (L.poster_h + L.row_gap)
+
+                raw_img = posters_raw[idx]
+                posters_raw[idx] = None  # transfer ownership
+                self._draw_game_card(draw, base_img, game, raw_img, x, y)
+
+            self._draw_logo_badge(draw, base_img, img_w, img_h)
+            self._draw_footer(draw, img_w, img_h)
+
+            # Save to JPEG
+            output = io.BytesIO()
+            rgb_img = base_img.convert("RGB")
+            try:
+                rgb_img.save(output, format="JPEG", quality=85)
+            finally:
+                rgb_img.close()
+            output.seek(0)
+            return output.getvalue()
+        finally:
+            base_img.close()
+            # Clean up any remaining poster images not yet closed
+            for img in posters_raw:
+                if img is not None:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass

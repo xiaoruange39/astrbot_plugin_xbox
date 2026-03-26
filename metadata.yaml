@@ -7,7 +7,7 @@ help: |
   
   配置说明：
   请在管理面板设置推送目标 (push_targets) 和推送时间 (cron_time)。
-version: 1.0.0
+version: 1.0.1
 author: xiaoruange39
 repo: "https://github.com/xiaoruange39/astrbot_plugin_xbox"
 astrbot_version: ">=4.16"
