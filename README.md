@@ -1,10 +1,10 @@
-![:name](https://count.getloli.com/@astrbot_plugin_xbox?name=astrbot_plugin_xbox&theme=booru-r6gdrawfriends&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
+![:name]()
 
 # Xbox Game Pass 入库提醒插件 🎮
 
 获取微软 Xbox Game Pass 最新入库游戏列表，支持后台定时推送新游提醒和手动查询。
 
-![XGP Preview](https://picui.ogmua.cn/s1/2026/03/15/69b6c6c6a6635.webp) 
+![XGP Preview](https://github.com/xiaoruange39/Plugin-Preview-Image/blob/main/image/FE1820139245A25E4F0D2276884EC54B.jpg) 
 
 ## ✨ 特性
 
