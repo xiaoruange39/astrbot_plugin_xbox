@@ -1,4 +1,4 @@
-![:name]()
+![:name](https://count.getloli.com/@astrbot_plugin_xbox?name=astrbot_plugin_xbox&theme=booru-r6gdrawfriends&padding=7&offset=0&align=t)
 
 # Xbox Game Pass 入库提醒插件 🎮
 
